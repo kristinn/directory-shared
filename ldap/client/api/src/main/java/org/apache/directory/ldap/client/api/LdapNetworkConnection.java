@@ -27,19 +27,27 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStreamWriter;
 import java.io.Writer;
-import java.net.ConnectException;
-import java.net.InetSocketAddress;
+import java.net.InetAddress;
 import java.net.SocketAddress;
-import java.nio.channels.UnresolvedAddressException;
+import java.net.InetSocketAddress;
+import java.net.UnknownHostException;
 import java.nio.charset.Charset;
 import java.security.PrivilegedExceptionAction;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CompletionService;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorCompletionService;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -152,6 +160,7 @@ import org.apache.directory.ldap.client.api.future.BindFuture;
 import org.apache.directory.ldap.client.api.future.CompareFuture;
 import org.apache.directory.ldap.client.api.future.DeleteFuture;
 import org.apache.directory.ldap.client.api.future.ExtendedFuture;
+import org.apache.directory.ldap.client.api.future.LdapNetworkConnectionFuture;
 import org.apache.directory.ldap.client.api.future.ModifyDnFuture;
 import org.apache.directory.ldap.client.api.future.ModifyFuture;
 import org.apache.directory.ldap.client.api.future.ResponseFuture;
@@ -228,6 +237,12 @@ public class LdapNetworkConnection extends AbstractLdapConnection implements Lda
 
     /** The Ldap codec protocol filter */
     private IoFilter ldapProtocolFilter = new ProtocolCodecFilter( codec.getProtocolCodecFactory() );
+
+    /** The cached thread pool used when trying to find a workable LDAP connection. */
+    private static ExecutorService executor = Executors.newCachedThreadPool();
+
+    /** The completion service helps us out when we need to wait for the LDAP connection futures to finish executing. */
+    private CompletionService<LdapNetworkConnectionFuture> completionService;
 
     /** the SslFilter key */
     private static final String SSL_FILTER_KEY = "sslFilter";
@@ -516,31 +531,55 @@ public class LdapNetworkConnection extends AbstractLdapConnection implements Lda
     }
 
 
+    //-------------------------- The methods ---------------------------//
     /**
      * Create the connector
      */
-    private void createConnector() throws LdapException
+    private IoConnector createConnector() throws LdapException
     {
         // Use only one thread inside the connector
-        connector = new NioSocketConnector( 1 );
+        IoConnector conn = new NioSocketConnector( 1 );
 
-        ( ( SocketSessionConfig ) connector.getSessionConfig() ).setReuseAddress( true );
+        ( ( SocketSessionConfig ) conn.getSessionConfig() ).setReuseAddress( true );
 
         // Add the codec to the chain
-        connector.getFilterChain().addLast( "ldapCodec", ldapProtocolFilter );
+        conn.getFilterChain().addLast( "ldapCodec", ldapProtocolFilter );
 
         // If we use SSL, we have to add the SslFilter to the chain
         if ( config.isUseSsl() )
         {
-            addSslFilter();
+            addSslFilter( conn );
         }
 
         // Inject the protocolHandler
-        connector.setHandler( this );
+        conn.setHandler( this );
+
+        return conn;
     }
 
+    /**
+     * Helper method that returns a future that is in the process of connecting to the provided address.
+     */
+    private Future<LdapNetworkConnectionFuture> connectFuture( final SocketAddress address ) throws LdapException, InterruptedException
+    {
+        final IoConnector conn = createConnector();
+        final long tout = config.getTimeout();
+        return completionService.submit( new Callable<LdapNetworkConnectionFuture>()
+            {
+                @Override
+                public LdapNetworkConnectionFuture call() throws Exception
+                {
+                    LdapNetworkConnectionFuture f = new LdapNetworkConnectionFuture();
+                    f.setConnectFuture( conn.connect( address ) );
+                    f.setConnector( conn );
+                    f.getConnectFuture().await( tout );
 
-    //-------------------------- The methods ---------------------------//
+                    return f;
+                }
+            }
+        );
+    }
+
     /**
      * {@inheritDoc}
      */
@@ -552,125 +591,122 @@ public class LdapNetworkConnection extends AbstractLdapConnection implements Lda
             return true;
         }
 
-        // Create the connector if needed
-        if ( connector == null )
+        // We look up all the IP addresses behind the given DNS name, since one name might point to both A (IPv4) and AAAA (IPv6) records.
+        InetAddress[] addresses;
+        try
         {
-            createConnector();
+            addresses = InetAddress.getAllByName( config.getLdapHost() );
+        }
+        catch ( UnknownHostException e )
+        {
+            throw new LdapOtherException( e.getMessage(), e );
         }
 
-        // Build the connection address
-        SocketAddress address = new InetSocketAddress( config.getLdapHost(), config.getLdapPort() );
-
-        // And create the connection future
-        timeout = config.getTimeout();
-        long maxRetry = System.currentTimeMillis() + timeout;
+        // We try to initialize a socket connection with all the IPs simultaneously, picking the first that succeeds and dropping the others.
         ConnectFuture connectionFuture = null;
-
-        while ( maxRetry > System.currentTimeMillis() )
+        final long giveUpAfter = System.currentTimeMillis() + timeout * 2;
+        this.completionService = new ExecutorCompletionService<>( executor );
+        Set<Future<LdapNetworkConnectionFuture>> futures = new HashSet<>();
+        for ( InetAddress addr : addresses )
         {
-            connectionFuture = connector.connect( address );
+            // Build the connection address
+            final SocketAddress address = new InetSocketAddress( addr, config.getLdapPort() );
 
-            boolean result = false;
-
-            // Wait until it's established
             try
             {
-                result = connectionFuture.await( timeout );
+                futures.add( connectFuture( address ) );
             }
             catch ( InterruptedException e )
             {
-                connector.dispose();
-                connector = null;
-                LOG.debug( "Interrupted while waiting for connection to establish with server {}:{}",
-                    config.getLdapHost(),
-                    config.getLdapPort(), e );
-                throw new LdapOtherException( e.getMessage(), e );
+                LOG.info( "InterruptedException occurred when connecting to " + address + " - Message: " + e.getMessage() );
             }
-            finally
+        }
+
+        // Wait for the futures to complete. Break out early if there is a successful connection.
+        while ( futures.size() > 0 && giveUpAfter > System.currentTimeMillis() )
+        {
+            Future<LdapNetworkConnectionFuture> completedFuture;
+            try
             {
-                if ( result )
+                // Let's retry every 5 seconds, so we don't end up in a complete lock.
+                completedFuture = completionService.poll( 5, TimeUnit.SECONDS );
+                if ( completedFuture == null )
                 {
-                    boolean isConnected = connectionFuture.isConnected();
-
-                    if ( !isConnected )
-                    {
-                        Throwable connectionException = connectionFuture.getException();
-
-                        if ( ( connectionException instanceof ConnectException )
-                            || ( connectionException instanceof UnresolvedAddressException ) )
-                        {
-                            // No need to wait
-                            // We know that there was a permanent error such as "connection refused".
-                            LOG.debug( "------>> Connection error: {}", connectionFuture.getException().getMessage() );
-                            break;
-                        }
-
-                        LOG.debug( "------>>   Cannot get the connection... Retrying" );
-
-                        // Wait 500 ms and retry
-                        try
-                        {
-                            Thread.sleep( 500 );
-                        }
-                        catch ( InterruptedException e )
-                        {
-                            connector = null;
-                            LOG.debug( "Interrupted while waiting for connection to establish with server {}:{}",
-                                config.getLdapHost(),
-                                config.getLdapPort(), e );
-                            throw new LdapOtherException( e.getMessage(), e );
-                        }
-                    }
-                    else
-                    {
-                        break;
-                    }
+                    continue;
                 }
+
+                futures.remove( completedFuture );
             }
+            catch ( InterruptedException e )
+            {
+                LOG.info( "InterruptedException occurred when waiting for a future to complete" );
+                continue;
+            }
+
+            LdapNetworkConnectionFuture result;
+            try
+            {
+                result = completedFuture.get();
+            }
+            catch ( InterruptedException e )
+            {
+                LOG.info( "InterruptedException occurred when fetching future results - Error: " + e.getMessage() );
+                continue;
+            }
+            catch ( ExecutionException e )
+            {
+                LOG.info( "ExecutionException occurred when fetching future results - Error: " + e.getMessage() );
+                continue;
+            }
+
+            if ( result.getConnectFuture() == null || !result.getConnectFuture().isConnected() )
+            {
+                if ( result.getConnector() != null )
+                {
+                    result.getConnector().dispose();
+                }
+
+                continue;
+            }
+
+            connectionFuture = result.getConnectFuture();
+            connector = result.getConnector();
+
+            break;
+        }
+
+        for ( Future<LdapNetworkConnectionFuture> future : futures )
+        {
+            LdapNetworkConnectionFuture futureToCancel;
+            try
+            {
+                futureToCancel = future.get();
+            }
+            catch ( InterruptedException e )
+            {
+                LOG.info( "InterruptedException thrown while cleaning up leftover futures/connections" );
+                future.cancel( true );
+                continue;
+            }
+            catch ( ExecutionException e )
+            {
+                LOG.info( "ExecutionException thrown while cleaning up leftover futures/connections" );
+                future.cancel( true );
+                continue;
+            }
+
+            if ( futureToCancel.getConnectFuture().isDone() && futureToCancel.getConnectFuture().isConnected() )
+            {
+                futureToCancel.getConnectFuture().getSession().closeNow();
+            }
+
+            futureToCancel.getConnector().dispose();
+            future.cancel( true );
         }
 
         if ( connectionFuture == null )
         {
-            connector.dispose();
-            throw new InvalidConnectionException( "Cannot connect" );
-        }
-
-        boolean isConnected = connectionFuture.isConnected();
-
-        if ( !isConnected )
-        {
-            // disposing connector if not connected
-            try
-            {
-                close();
-            }
-            catch ( IOException ioe )
-            {
-                // Nothing to do
-            }
-
-            Throwable e = connectionFuture.getException();
-
-            if ( e != null )
-            {
-                StringBuilder message = new StringBuilder( "Cannot connect to the server: " );
-
-                // Special case for UnresolvedAddressException
-                // (most of the time no message is associated with this exception)
-                if ( ( e instanceof UnresolvedAddressException ) && ( e.getMessage() == null ) )
-                {
-                    message.append( "Hostname '" );
-                    message.append( config.getLdapHost() );
-                    message.append( "' could not be resolved." );
-                    throw new InvalidConnectionException( message.toString(), e );
-                }
-
-                // Default case
-                message.append( e.getMessage() );
-                throw new InvalidConnectionException( message.toString(), e );
-            }
-
-            return false;
+            throw new InvalidConnectionException( "Exhausted all options while trying to connect to ldap - giving up!" );
         }
 
         // Get the close future for this session
@@ -3875,7 +3911,7 @@ public class LdapNetworkConnection extends AbstractLdapConnection implements Lda
 
             if ( result.getResultCode() == ResultCodeEnum.SUCCESS )
             {
-                addSslFilter();
+                addSslFilter( null );
             }
             else
             {
@@ -3896,7 +3932,7 @@ public class LdapNetworkConnection extends AbstractLdapConnection implements Lda
     /**
      * adds {@link SslFilter} to the IOConnector or IOSession's filter chain
      */
-    private void addSslFilter() throws LdapException
+    private void addSslFilter( IoConnector conn ) throws LdapException
     {
         try
         {
@@ -3931,7 +3967,7 @@ public class LdapNetworkConnection extends AbstractLdapConnection implements Lda
             // for LDAPS
             if ( ldapSession == null )
             {
-                connector.getFilterChain().addFirst( SSL_FILTER_KEY, sslFilter );
+                conn.getFilterChain().addFirst( SSL_FILTER_KEY, sslFilter );
             }
             else
             // for StartTLS
